@@ -5,16 +5,19 @@ const path = require('path');
 
 // 初始化 Express
 const app = express();
-app.use(express.urlencoded({ extended: true })); // 解析表單數據
-app.use(express.static('public')); // 提供靜態文件（HTML、CSS）
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static('public'));
 
 // 配置
 const BASE_URL = 'https://rnr.valuegb.com/RNR_TW/rnr_action.jsp';
-const MAX_SIM_PER_NAME = 5; // 每個姓名最多用於 5 張 SIM 卡
+const MAX_SIM_PER_NAME = 5;
 const TEST_SIMS = 100; // 測試 100 個 ICCID（可改為 100000）
-const BATCH_SIZE = 5; // 每批處理 5 個
-const MIN_DELAY_MS = 2000; // 最小延遲 2 秒
-const MAX_DELAY_MS = 5000; // 最大延遲 5 秒
+const BATCH_SIZE = 5;
+const MIN_DELAY_MS = 2000;
+const MAX_DELAY_MS = 5000;
+
+// 存儲激活任務狀態
+const tasks = new Map(); // 任務 ID -> { status, results, prefix }
 
 // 隨機 User-Agent 列表
 const USER_AGENTS = [
@@ -34,7 +37,7 @@ function randomDelay() {
   return new Promise((resolve) => setTimeout(resolve, delay));
 }
 
-// 生成隨機英文姓名（例如 FUNG CHI KAUN）
+// 生成隨機英文姓名
 function generateName() {
   const firstNames = ['FUNG', 'CHAN', 'WONG', 'LEUNG', 'TAM', 'HO', 'LI', 'CHEUNG'];
   const middleNames = ['CHI', 'MAN', 'WAI', 'KA', 'YING', 'HIN', 'SIU'];
@@ -44,7 +47,7 @@ function generateName() {
   } ${lastNames[Math.floor(Math.random() * lastNames.length)]}`;
 }
 
-// 生成護照號碼（5 個字母 + 3 位數字）
+// 生成護照號碼
 function generatePassportNumber() {
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   let passport = '';
@@ -120,14 +123,17 @@ async function activateSIM(iccid, name, passportNumber) {
         result.message = `未知回應: ${response.data}`;
     }
 
+    console.error(`ICCID: ${iccid}, 狀態: ${result.status}, 訊息: ${result.message}`);
     return result;
   } catch (error) {
+    const errorMsg = `激活 ${iccid} 失敗: ${error.message}`;
+    console.error(errorMsg);
     return {
       iccid,
       name,
       passportNumber,
       status: '失敗',
-      message: `請求失敗: ${error.message}`,
+      message: errorMsg,
     };
   }
 }
@@ -145,11 +151,15 @@ async function initLogFile() {
 }
 
 // 激活 SIM 卡主邏輯
-async function activateSIMs(prefix, res) {
+async function activateSIMs(prefix, taskId) {
   if (!/^\d{15}$/.test(prefix)) {
-    res.send('錯誤：ICCID 前綴必須為 15 位數字');
+    tasks.set(taskId, { status: 'failed', message: '錯誤：ICCID 前綴必須為 15 位數字', results: [] });
+    console.error(`任務 ${taskId}: 無效 ICCID 前綴 ${prefix}`);
     return;
   }
+
+  tasks.set(taskId, { status: 'running', results: [], prefix });
+  console.error(`任務 ${taskId}: 開始 SIM 卡激活，使用前綴: ${prefix}`);
 
   await initLogFile();
   let currentName = generateName();
@@ -184,53 +194,12 @@ async function activateSIMs(prefix, res) {
       results.push(result);
     }
 
-    await randomDelay(); // 隨機延遲 2-5 秒
+    tasks.set(taskId, { status: 'running', results, prefix });
+    await randomDelay();
   }
 
-  // 顯示結果
-  res.send(`
-    <html>
-      <head>
-        <title>SIM 卡激活結果</title>
-        <meta charset="utf-8">
-        <style>
-          body { font-family: Arial, sans-serif; margin: 20px; }
-          h1 { color: #333; }
-          table { border-collapse: collapse; width: 100%; }
-          th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-          th { background-color: #f2f2f2; }
-          .success { color: green; }
-          .failure { color: red; }
-        </style>
-      </head>
-      <body>
-        <h1>SIM 卡激活結果（前綴：${prefix}）</h1>
-        <p>激活完成，結果已記錄到 activation_log.csv</p>
-        <table>
-          <tr>
-            <th>ICCID</th>
-            <th>英文姓名</th>
-            <th>護照號碼</th>
-            <th>狀態</th>
-            <th>訊息</th>
-          </tr>
-          ${results
-            .map(
-              (r) => `
-                <tr>
-                  <td>${r.iccid}</td>
-                  <td>${r.name}</td>
-                  <td>${r.passportNumber}</td>
-                  <td class="${r.status === '成功' ? 'success' : 'failure'}">${r.status}</td>
-                  <td>${r.message}</td>
-                </tr>`
-            )
-            .join('')}
-        </table>
-        <p><a href="/">返回表單</a></p>
-      </body>
-    </html>
-  `);
+  tasks.set(taskId, { status: 'completed', results, prefix });
+  console.error(`任務 ${taskId}: 激活完成，結果已記錄到 activation_log.csv`);
 }
 
 // Web 表單路由
@@ -266,11 +235,138 @@ app.get('/', (req, res) => {
 // 處理表單提交
 app.post('/activate', async (req, res) => {
   const prefix = req.body.iccid_prefix;
-  await activateSIMs(prefix, res);
+  const taskId = Date.now().toString(); // 簡單的任務 ID
+
+  // 啟動激活任務（後台運行）
+  activateSIMs(prefix, taskId).catch((error) => {
+    console.error(`任務 ${taskId} 錯誤: ${error.message}`);
+    tasks.set(taskId, { status: 'failed', message: error.message, results: [] });
+  });
+
+  // 立即返回響應，告知客戶任務正在運行
+  res.send(`
+    <html>
+      <head>
+        <title>SIM 卡激活</title>
+        <meta charset="utf-8">
+        <style>
+          body { font-family: Arial, sans-serif; margin: 20px; }
+          h1 { color: #333; }
+        </style>
+      </head>
+      <body>
+        <h1>激活任務已啟動</h1>
+        <p>正在處理 ICCID 前綴：${prefix}</p>
+        <p>任務 ID：${taskId}</p>
+        <p>請稍後訪問 <a href="/status/${taskId}">任務狀態</a> 查看進度或結果。</p>
+        <p><a href="/">返回表單</a></p>
+      </body>
+    </html>
+  `);
+});
+
+// 檢查任務狀態
+app.get('/status/:taskId', (req, res) => {
+  const taskId = req.params.taskId;
+  const task = tasks.get(taskId);
+
+  if (!task) {
+    res.send(`
+      <html>
+        <head><title>任務不存在</title><meta charset="utf-8"></head>
+        <body>
+          <h1>任務不存在</h1>
+          <p>無效的任務 ID：${taskId}</p>
+          <p><a href="/">返回表單</a></p>
+        </body>
+      </html>
+    `);
+    return;
+  }
+
+  if (task.status === 'failed') {
+    res.send(`
+      <html>
+        <head><title>任務失敗</title><meta charset="utf-8"></head>
+        <body>
+          <h1>任務失敗</h1>
+          <p>ICCID 前綴：${task.prefix}</p>
+          <p>錯誤：${task.message}</p>
+          <p><a href="/">返回表單</a></p>
+        </body>
+      </html>
+    `);
+    return;
+  }
+
+  res.send(`
+    <html>
+      <head>
+        <title>SIM 卡激活結果</title>
+        <meta charset="utf-8">
+        <style>
+          body { font-family: Arial, sans-serif; margin: 20px; }
+          h1 { color: #333; }
+          table { border-collapse: collapse; width: 100%; }
+          th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+          th { background-color: #f2f2f2; }
+          .success { color: green; }
+          .failure { color: red; }
+        </style>
+      </head>
+      <body>
+        <h1>SIM 卡激活結果（前綴：${task.prefix}）</h1>
+        <p>任務狀態：${task.status === 'running' ? '運行中' : '已完成'}</p>
+        <p>已處理 ${task.results.length} / ${TEST_SIMS} 個 ICCID</p>
+        <p><a href="/download/${taskId}">下載結果 CSV</a></p>
+        <table>
+          <tr>
+            <th>ICCID</th>
+            <th>英文姓名</th>
+            <th>護照號碼</th>
+            <th>狀態</th>
+            <th>訊息</th>
+          </tr>
+          ${task.results
+            .map(
+              (r) => `
+                <tr>
+                  <td>${r.iccid}</td>
+                  <td>${r.name}</td>
+                  <td>${r.passportNumber}</td>
+                  <td class="${r.status === '成功' ? 'success' : 'failure'}">${r.status}</td>
+                  <td>${r.message}</td>
+                </tr>`
+            )
+            .join('')}
+        </table>
+        <p><a href="/">返回表單</a></p>
+      </body>
+    </html>
+  `);
+});
+
+// 下載 CSV
+app.get('/download/:taskId', async (req, res) => {
+  const taskId = req.params.taskId;
+  const task = tasks.get(taskId);
+
+  if (!task) {
+    res.status(404).send('任務不存在');
+    return;
+  }
+
+  const filePath = 'activation_log.csv';
+  try {
+    await fs.access(filePath);
+    res.download(filePath, `activation_log_${task.prefix}.csv`);
+  } catch (error) {
+    res.status(404).send('結果文件不可用，請檢查任務狀態');
+  }
 });
 
 // 啟動服務器
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`服務器運行在端口 ${PORT}`);
+  console.error(`服務器運行在端口 ${PORT}`);
 });

@@ -5,8 +5,28 @@ const fs = require('fs').promises;
 const BASE_URL = 'https://rnr.valuegb.com/RNR_TW/rnr_action.jsp';
 const PREFIX = '898520624103438'; // 客戶提供的前綴
 const MAX_SIM_PER_NAME = 5; // 每個姓名最多用於 5 張 SIM 卡
-const TEST_SIMS = 10; // 測試 10 個 ICCID
+const TEST_SIMS = 100; // 測試 100 個 ICCID（可改為 100000）
 const BATCH_SIZE = 5; // 每批處理 5 個
+const MIN_DELAY_MS = 2000; // 最小延遲 2 秒
+const MAX_DELAY_MS = 5000; // 最大延遲 5 秒
+
+// 隨機 User-Agent 列表，模擬不同設備
+const USER_AGENTS = [
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.5060.114 Mobile Safari/537.36',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Mobile/15E148 Safari/604.1',
+];
+
+// 隨機選擇 User-Agent
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+// 隨機延遲
+function randomDelay() {
+  const delay = Math.floor(Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS + 1)) + MIN_DELAY_MS;
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
 
 // 生成隨機英文姓名（例如 FUNG CHI KAUN）
 function generateName() {
@@ -39,20 +59,26 @@ async function activateSIM(iccid, name, passportNumber) {
   try {
     const response = await axios.post(
       BASE_URL,
-      {
+      new URLSearchParams({
         e_name: name,
         iccid: iccid,
         id_type: 'passport',
         id_code: passportNumber,
-        hkid: '', // 護照無需 HKID
+        hkid: '',
         licensee: 'vgb',
-      },
+      }).toString(),
       {
-        timeout: 60000, // 60 秒超時
+        headers: {
+          'User-Agent': getRandomUserAgent(),
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Referer': 'https://rnr.valuegb.com/RNR_TW/rnr.jsp?lang=zh&type=vgb',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        timeout: 60000,
       }
     );
 
-    // 處理回應（根據 HTML 的 popup0 錯誤代碼）
     const result = {
       iccid,
       name,
@@ -79,7 +105,6 @@ async function activateSIM(iccid, name, passportNumber) {
         result.message = 'SIM 卡已完成登記，無需再次登記';
         break;
       case 2:
-        result Depp
         result.status = '失敗';
         result.message = '請輸入有效的 ICCID 號碼';
         break;
@@ -89,7 +114,7 @@ async function activateSIM(iccid, name, passportNumber) {
         break;
       default:
         result.status = '失敗';
-        result.message = '上傳失敗，請稍後再試';
+        result.message = `未知回應: ${response.data}`;
     }
 
     return result;
@@ -118,6 +143,7 @@ async function initLogFile() {
 
 // 主函數
 async function main() {
+  console.log('開始 SIM 卡激活...');
   await initLogFile();
   let currentName = generateName();
   let nameCount = 0;
@@ -128,7 +154,6 @@ async function main() {
       const suffix = (i + j).toString().padStart(5, '0');
       const iccid = PREFIX + suffix;
 
-      // 檢查姓名使用次數
       if (nameCount >= MAX_SIM_PER_NAME) {
         currentName = generateName();
         nameCount = 0;
@@ -144,18 +169,16 @@ async function main() {
       batch.push(activateSIM(iccid, currentName, passportNumber));
     }
 
-    // 並行處理批次
     const results = await Promise.all(batch);
     for (const result of results) {
       await logResult(result);
       console.log(`ICCID: ${result.iccid}, 狀態: ${result.status}, 訊息: ${result.message}`);
     }
 
-    // 批次間隔 1 秒
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await randomDelay(); // 隨機延遲 2-5 秒
   }
 
-  console.log('測試完成，結果已記錄到 activation_log.csv');
+  console.log('激活完成，結果已記錄到 activation_log.csv');
 }
 
 // 啟動腳本

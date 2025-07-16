@@ -1,0 +1,12 @@
+{
+  "name": "sim-activation",
+  "version": "1.0.0",
+  "description": "自動激活 SIM 卡",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2"
+  }
+}

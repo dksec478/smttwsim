@@ -1,16 +1,22 @@
 const axios = require('axios');
+const express = require('express');
 const fs = require('fs').promises;
+const path = require('path');
+
+// 初始化 Express
+const app = express();
+app.use(express.urlencoded({ extended: true })); // 解析表單數據
+app.use(express.static('public')); // 提供靜態文件（HTML、CSS）
 
 // 配置
 const BASE_URL = 'https://rnr.valuegb.com/RNR_TW/rnr_action.jsp';
-const PREFIX = '898520624103438'; // 客戶提供的前綴
 const MAX_SIM_PER_NAME = 5; // 每個姓名最多用於 5 張 SIM 卡
 const TEST_SIMS = 100; // 測試 100 個 ICCID（可改為 100000）
 const BATCH_SIZE = 5; // 每批處理 5 個
 const MIN_DELAY_MS = 2000; // 最小延遲 2 秒
 const MAX_DELAY_MS = 5000; // 最大延遲 5 秒
 
-// 隨機 User-Agent 列表，模擬不同設備
+// 隨機 User-Agent 列表
 const USER_AGENTS = [
   'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
   'Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.5060.114 Mobile Safari/537.36',
@@ -50,9 +56,6 @@ function generatePassportNumber() {
     .padStart(3, '0');
   return passport;
 }
-
-// 跟踪姓名使用次數
-const nameUsage = new Map();
 
 // 提交激活請求
 async function activateSIM(iccid, name, passportNumber) {
@@ -141,18 +144,24 @@ async function initLogFile() {
   await fs.writeFile('activation_log.csv', header);
 }
 
-// 主函數
-async function main() {
-  console.log('開始 SIM 卡激活...');
+// 激活 SIM 卡主邏輯
+async function activateSIMs(prefix, res) {
+  if (!/^\d{15}$/.test(prefix)) {
+    res.send('錯誤：ICCID 前綴必須為 15 位數字');
+    return;
+  }
+
   await initLogFile();
   let currentName = generateName();
   let nameCount = 0;
+  const nameUsage = new Map();
+  const results = [];
 
   for (let i = 0; i < TEST_SIMS; i += BATCH_SIZE) {
     const batch = [];
     for (let j = 0; j < BATCH_SIZE && i + j < TEST_SIMS; j++) {
       const suffix = (i + j).toString().padStart(5, '0');
-      const iccid = PREFIX + suffix;
+      const iccid = prefix + suffix;
 
       if (nameCount >= MAX_SIM_PER_NAME) {
         currentName = generateName();
@@ -169,19 +178,99 @@ async function main() {
       batch.push(activateSIM(iccid, currentName, passportNumber));
     }
 
-    const results = await Promise.all(batch);
-    for (const result of results) {
+    const batchResults = await Promise.all(batch);
+    for (const result of batchResults) {
       await logResult(result);
-      console.log(`ICCID: ${result.iccid}, 狀態: ${result.status}, 訊息: ${result.message}`);
+      results.push(result);
     }
 
     await randomDelay(); // 隨機延遲 2-5 秒
   }
 
-  console.log('激活完成，結果已記錄到 activation_log.csv');
+  // 顯示結果
+  res.send(`
+    <html>
+      <head>
+        <title>SIM 卡激活結果</title>
+        <meta charset="utf-8">
+        <style>
+          body { font-family: Arial, sans-serif; margin: 20px; }
+          h1 { color: #333; }
+          table { border-collapse: collapse; width: 100%; }
+          th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+          th { background-color: #f2f2f2; }
+          .success { color: green; }
+          .failure { color: red; }
+        </style>
+      </head>
+      <body>
+        <h1>SIM 卡激活結果（前綴：${prefix}）</h1>
+        <p>激活完成，結果已記錄到 activation_log.csv</p>
+        <table>
+          <tr>
+            <th>ICCID</th>
+            <th>英文姓名</th>
+            <th>護照號碼</th>
+            <th>狀態</th>
+            <th>訊息</th>
+          </tr>
+          ${results
+            .map(
+              (r) => `
+                <tr>
+                  <td>${r.iccid}</td>
+                  <td>${r.name}</td>
+                  <td>${r.passportNumber}</td>
+                  <td class="${r.status === '成功' ? 'success' : 'failure'}">${r.status}</td>
+                  <td>${r.message}</td>
+                </tr>`
+            )
+            .join('')}
+        </table>
+        <p><a href="/">返回表單</a></p>
+      </body>
+    </html>
+  `);
 }
 
-// 啟動腳本
-main().catch((error) => {
-  console.error('腳本運行錯誤:', error);
+// Web 表單路由
+app.get('/', (req, res) => {
+  res.send(`
+    <html>
+      <head>
+        <title>SIM 卡激活</title>
+        <meta charset="utf-8">
+        <style>
+          body { font-family: Arial, sans-serif; margin: 20px; }
+          h1 { color: #333; }
+          .form-container { max-width: 500px; }
+          input[type="text"] { width: 100%; padding: 8px; margin: 10px 0; }
+          input[type="submit"] { padding: 10px 20px; background: #ff6f00; color: white; border: none; cursor: pointer; }
+          input[type="submit"]:hover { background: #e65f00; }
+        </style>
+      </head>
+      <body>
+        <h1>輸入 ICCID 前綴</h1>
+        <div class="form-container">
+          <form action="/activate" method="post">
+            <label>ICCID 前綴（15 位數字）:</label>
+            <input type="text" name="iccid_prefix" placeholder="例如 898520624103438" required>
+            <input type="submit" value="開始激活">
+          </form>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
+// 處理表單提交
+app.post('/activate', async (req, res) => {
+  const prefix = req.body.iccid_prefix;
+  await activateSIMs(prefix, res);
+});
+
+// 啟動服務器
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`服務器運行在端口 ${PORT}`);
 });

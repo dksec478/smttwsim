@@ -11,7 +11,7 @@ app.use(express.static('public'));
 // 配置
 const BASE_URL = 'https://rnr.valuegb.com/RNR_TW/rnr_action.jsp';
 const MAX_SIM_PER_NAME = 5;
-const TEST_SIMS = 100; // 測試 100 個 ICCID（可改為 100000）
+const TEST_SIMS = 100000; // 測試 100 個 ICCID（可改為 100000）
 const BATCH_SIZE = 5;
 const MIN_DELAY_MS = 2000;
 const MAX_DELAY_MS = 5000;

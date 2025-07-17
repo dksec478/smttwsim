@@ -10,14 +10,12 @@ app.use(express.static('public'));
 
 // 配置
 const BASE_URL = 'https://rnr.valuegb.com/RNR_TW/rnr_action.jsp';
-const MAX_SIM_PER_NAME = 5;
-const TEST_SIMS = 100000; // 測試 100 個 ICCID（可改為 100000）
-const BATCH_SIZE = 5;
-const MIN_DELAY_MS = 2000;
-const MAX_DELAY_MS = 5000;
-
-// 存儲激活任務狀態
-const tasks = new Map(); // 任務 ID -> { status, results, prefix }
+const MAX_SIM_PER_NAME = 5; // 每個姓名最多用於 5 張 SIM 卡
+const TOTAL_SIMS = 10000; // 總共處理 10,000 個 ICCID
+const TEST_BATCH_SIZE = 30; // 前綴驗證批次大小
+const BATCH_SIZE = 5; // 正常激活批次大小
+const MIN_DELAY_MS = 2000; // 最小延遲 2 秒
+const MAX_DELAY_MS = 5000; // 最大延遲 5 秒
 
 // 隨機 User-Agent 列表
 const USER_AGENTS = [
@@ -59,6 +57,9 @@ function generatePassportNumber() {
     .padStart(3, '0');
   return passport;
 }
+
+// 存儲激活任務狀態
+const tasks = new Map(); // 任務 ID -> { status, results, prefix, message }
 
 // 提交激活請求
 async function activateSIM(iccid, name, passportNumber) {
@@ -150,16 +151,16 @@ async function initLogFile() {
   await fs.writeFile('activation_log.csv', header);
 }
 
-// 激活 SIM 卡主邏輯
+// 激活 SIM 卡主邏輯（包含前綴驗證）
 async function activateSIMs(prefix, taskId) {
   if (!/^\d{15}$/.test(prefix)) {
-    tasks.set(taskId, { status: 'failed', message: '錯誤：ICCID 前綴必須為 15 位數字', results: [] });
+    tasks.set(taskId, { status: 'failed', message: '錯誤：ICCID 前綴必須為 15 位數字', results: [], prefix });
     console.error(`任務 ${taskId}: 無效 ICCID 前綴 ${prefix}`);
     return;
   }
 
-  tasks.set(taskId, { status: 'running', results: [], prefix });
-  console.error(`任務 ${taskId}: 開始 SIM 卡激活，使用前綴: ${prefix}`);
+  tasks.set(taskId, { status: 'validating', results: [], prefix });
+  console.error(`任務 ${taskId}: 開始驗證 ICCID 前綴: ${prefix}`);
 
   await initLogFile();
   let currentName = generateName();
@@ -167,9 +168,60 @@ async function activateSIMs(prefix, taskId) {
   const nameUsage = new Map();
   const results = [];
 
-  for (let i = 0; i < TEST_SIMS; i += BATCH_SIZE) {
+  // 階段 1：驗證前 30 個 ICCID
+  let isPrefixValid = false;
+  for (let i = 0; i < TEST_BATCH_SIZE; i += BATCH_SIZE) {
     const batch = [];
-    for (let j = 0; j < BATCH_SIZE && i + j < TEST_SIMS; j++) {
+    for (let j = 0; j < BATCH_SIZE && i + j < TEST_BATCH_SIZE; j++) {
+      const suffix = (i + j).toString().padStart(5, '0');
+      const iccid = prefix + suffix;
+
+      if (nameCount >= MAX_SIM_PER_NAME) {
+        currentName = generateName();
+        nameCount = 0;
+        while (nameUsage.has(currentName) && nameUsage.get(currentName) >= MAX_SIM_PER_NAME) {
+          currentName = generateName();
+        }
+      }
+
+      nameUsage.set(currentName, (nameUsage.get(currentName) || 0) + 1);
+      nameCount++;
+
+      const passportNumber = generatePassportNumber();
+      batch.push(activateSIM(iccid, currentName, passportNumber));
+    }
+
+    const batchResults = await Promise.all(batch);
+    for (const result of batchResults) {
+      await logResult(result);
+      results.push(result);
+      if (result.status === '成功' || result.message === 'SIM 卡已完成登記，無需再次登記') {
+        isPrefixValid = true;
+      }
+    }
+
+    tasks.set(taskId, { status: 'validating', results, prefix });
+    await randomDelay();
+  }
+
+  if (!isPrefixValid) {
+    tasks.set(taskId, {
+      status: 'failed',
+      message: 'ICCID 前綴無效：前 30 個 ICCID 無成功激活或已激活記錄',
+      results,
+      prefix,
+    });
+    console.error(`任務 ${taskId}: ICCID 前綴 ${prefix} 無效，停止激活`);
+    return;
+  }
+
+  // 階段 2：前綴有效，繼續處理剩餘 ICCID
+  tasks.set(taskId, { status: 'running', results, prefix });
+  console.error(`任務 ${taskId}: 前綴 ${prefix} 驗證通過，繼續激活剩餘 ${TOTAL_SIMS - TEST_BATCH_SIZE} 個 ICCID`);
+
+  for (let i = TEST_BATCH_SIZE; i < TOTAL_SIMS; i += BATCH_SIZE) {
+    const batch = [];
+    for (let j = 0; j < BATCH_SIZE && i + j < TOTAL_SIMS; j++) {
       const suffix = (i + j).toString().padStart(5, '0');
       const iccid = prefix + suffix;
 
@@ -235,15 +287,15 @@ app.get('/', (req, res) => {
 // 處理表單提交
 app.post('/activate', async (req, res) => {
   const prefix = req.body.iccid_prefix;
-  const taskId = Date.now().toString(); // 簡單的任務 ID
+  const taskId = Date.now().toString();
 
   // 啟動激活任務（後台運行）
   activateSIMs(prefix, taskId).catch((error) => {
     console.error(`任務 ${taskId} 錯誤: ${error.message}`);
-    tasks.set(taskId, { status: 'failed', message: error.message, results: [] });
+    tasks.set(taskId, { status: 'failed', message: error.message, results: [], prefix });
   });
 
-  // 立即返回響應，告知客戶任務正在運行
+  // 立即返回響應
   res.send(`
     <html>
       <head>
@@ -316,8 +368,8 @@ app.get('/status/:taskId', (req, res) => {
       </head>
       <body>
         <h1>SIM 卡激活結果（前綴：${task.prefix}）</h1>
-        <p>任務狀態：${task.status === 'running' ? '運行中' : '已完成'}</p>
-        <p>已處理 ${task.results.length} / ${TEST_SIMS} 個 ICCID</p>
+        <p>任務狀態：${task.status === 'validating' ? '驗證前綴中' : task.status === 'running' ? '運行中' : '已完成'}</p>
+        <p>已處理 ${task.results.length} / ${TOTAL_SIMS} 個 ICCID</p>
         <p><a href="/download/${taskId}">下載結果 CSV</a></p>
         <table>
           <tr>
